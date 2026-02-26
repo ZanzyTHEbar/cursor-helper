@@ -76,7 +76,8 @@ pub fn update_storage_json<P: AsRef<Path>>(
 /// Cursor stores several workspace mappings and references in the global database:
 /// - `ItemTable.value` / `ItemTable.key`
 /// - `cursorDiskKV.key` / `cursorDiskKV.value`
-/// This updates any exact path hash strings from old values to new ones, which
+///
+/// Updates any exact path/hash strings from old values to new ones, which
 /// helps keep move/copy operations from leaving stale workspace IDs behind.
 pub fn update_global_state_db<P: AsRef<Path>>(
     state_db: P,

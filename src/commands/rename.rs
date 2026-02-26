@@ -84,25 +84,25 @@ pub fn execute(
     let action = if copy_mode { "Copying" } else { "Moving" };
 
     // Print summary
-    println!("{}");
+    println!();
     println!(
         "{}",
         format!("=== Cursor Project {} Tool ===", mode).green()
     );
-    println!("{}");
+    println!();
     println!("Old path: {}", old_path.display());
     println!("New path: {}", new_path.display());
     println!("Mode: {}", mode);
     println!("Force index: {}", if force_index { "on" } else { "off" });
-    println!("{}", "");
+    println!();
     println!("Old folder ID: {}", old_folder_id);
     println!("Old workspace hash: {}", old_workspace_hash);
-    println!("{}", "");
+    println!();
 
     // Check if old data exists
     print_exists_status("Cursor projects dir", &old_projects_dir);
     print_exists_status("Workspace storage dir", &old_workspace_dir);
-    println!("{}");
+    println!();
 
     // Confirm (skip in dry-run)
     if !dry_run {
@@ -358,7 +358,7 @@ pub fn execute(
     // Step 8: Clear stale cache directories
     println!("{}", "Step 8: Clearing stale cache data...".green());
     if !dry_run {
-        if let Ok(true) = new_workspace_dir.exists().then_some(true) {
+        if new_workspace_dir.exists() {
             clear_path(
                 &new_workspace_dir.join("anysphere.cursor-retrieval"),
                 dry_run,
@@ -377,9 +377,9 @@ pub fn execute(
     }
 
     // Done!
-    println!("{}");
+    println!();
     println!("{}", format!("=== {} complete! ===", mode).green());
-    println!("{}");
+    println!();
 
     if dry_run {
         println!("This was a dry-run. No changes were made.");
@@ -388,7 +388,7 @@ pub fn execute(
         println!("You can now open {} in Cursor.", new_path.display());
         println!("Your chat history and workspace settings should be preserved.");
         if copy_mode {
-            println!("{}");
+            println!();
             println!(
                 "Original project at {} was kept intact.",
                 old_path.display()
@@ -400,6 +400,7 @@ pub fn execute(
 }
 
 /// Update composer index in workspace state DB when copied from an existing workspace
+#[allow(clippy::too_many_arguments)]
 fn sync_workspace_composer_index(
     source_db_path: Option<&Path>,
     target_db_path: &Path,
@@ -437,9 +438,7 @@ fn sync_workspace_composer_index(
 
     let target_data = fetch_composer_data(&target_conn)?;
 
-    let target_has_all_composers = target_data
-        .as_deref()
-        .is_some_and(|data| has_all_composers(data));
+    let target_has_all_composers = target_data.as_deref().is_some_and(has_all_composers);
     let mut needs_update = force_index || !target_has_all_composers;
     if source_data.is_none() && force_index {
         needs_update = true;
