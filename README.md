@@ -48,9 +48,36 @@ cursor-helper rename /path/to/old-project /path/to/new-project
 # Copy instead of move
 cursor-helper rename --copy /path/to/project /path/to/project-copy
 
+# Copy with full composer index rebuild (force re-index of chat sidebar)
+cursor-helper rename --copy --force-index /path/to/project /path/to/project-copy
+
 # Preview changes first
 cursor-helper rename -n /path/to/old /path/to/new
 ```
+
+For `--copy`, the command now:
+
+- copies the full `workspaceStorage/<hash>/` directory instead of only `state.vscdb`
+- updates `folderUri` / workspace mappings in `storage.json` and `globalStorage/state.vscdb`
+- rewrites `composer.composerData` in the target workspace database (including normalized paths and hashes)
+- clears stale cache folders:
+  - `<Cursor config>/CachedData/`
+  - `<Cursor config>/GPUCache/`
+  - `<new workspace hash>/anysphere.cursor-retrieval/`
+
+Suggested validation cases:
+
+1. **same filesystem rename**
+   `cursor-helper rename /tmp/proj /tmp/proj-renamed` and verify chat count matches before/after in `list`.
+
+2. **cross-filesystem copy**
+   Copy a project from one mount to another and run `cursor-helper rename --copy /mnt/source/proj /mnt/other/proj-copy`; confirm `list` shows full history in Cursor.
+
+3. **UI refresh path**
+   Open Cursor after copy and confirm:
+   - sidebar shows full chat list
+   - individual sessions load correctly
+   - no duplicate or missing workspace prompts
 
 ### `export-chat` — Export Everything Cursor Hides
 
