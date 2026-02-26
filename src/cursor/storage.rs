@@ -138,6 +138,10 @@ pub fn update_global_state_db<P: AsRef<Path>>(
                 continue;
             };
 
+            if !has_workspace_scoped_reference(&value, &normalized_replacements) {
+                continue;
+            }
+
             let normalized = normalize_text_replacements(&value, &normalized_replacements);
 
             if normalized == value {
@@ -165,6 +169,50 @@ pub fn update_global_state_db<P: AsRef<Path>>(
     }
 
     Ok(modified)
+}
+
+fn has_workspace_scoped_reference(value: &str, replacements: &[(String, String)]) -> bool {
+    let candidates: Vec<&str> = replacements
+        .iter()
+        .filter_map(|(old, new)| (old != new).then_some(old.as_str()))
+        .collect();
+
+    candidates
+        .iter()
+        .any(|old| has_safe_suffix_match(value, old))
+}
+
+fn has_safe_suffix_match(value: &str, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+
+    let mut offset = 0usize;
+    while let Some(pos) = value[offset..].find(pattern) {
+        let absolute_pos = offset + pos;
+        let suffix = value[absolute_pos + pattern.len()..].chars().next();
+
+        if is_workspace_value_suffix_terminator(suffix) {
+            return true;
+        }
+
+        offset = absolute_pos + 1;
+    }
+
+    false
+}
+
+fn is_workspace_value_suffix_terminator(suffix: Option<char>) -> bool {
+    match suffix {
+        None => true,
+        Some(suffix) => {
+            !suffix.is_ascii_alphanumeric()
+                && suffix != '_'
+                && suffix != '-'
+                && suffix != '.'
+                && suffix != '%'
+        }
+    }
 }
 
 fn normalize_text_replacements(value: &str, replacements: &[(String, String)]) -> String {
@@ -496,5 +544,73 @@ mod tests {
         assert!(!item_value.contains("project-copy-copy"));
         assert!(!item_key.contains("project-copy-copy"));
         assert!(modified);
+    }
+
+    #[test]
+    fn test_update_global_state_db_does_not_modify_workspace_prefix_matches() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("state-prefix.vscdb");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+            (
+                "workspace.key.file:///home/user/project",
+                "meta:file:///home/user/project/hash-old",
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+            (
+                "workspace.key.file:///home/user/projects/foo",
+                "meta:file:///home/user/projects/foo/hash-other",
+            ),
+        )
+        .unwrap();
+        drop(conn);
+
+        let modified = update_global_state_db(
+            &db_path,
+            "/home/user/project",
+            "/home/user/project-copy",
+            "file:///home/user/project",
+            "file:///home/user/project-copy",
+            "hash-old",
+            "hash-new",
+            false,
+        )
+        .unwrap();
+        assert!(modified);
+
+        let conn = Connection::open(&db_path).unwrap();
+        let updated_value: String = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = 'workspace.key.file:///home/user/project-copy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let untouched_value: String = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = 'workspace.key.file:///home/user/projects/foo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            updated_value,
+            "meta:file:///home/user/project-copy/hash-new"
+        );
+        assert_eq!(
+            untouched_value,
+            "meta:file:///home/user/projects/foo/hash-other"
+        );
     }
 }
