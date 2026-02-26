@@ -236,7 +236,7 @@ fn normalize_text_replacements(value: &str, replacements: &[(String, String)]) -
             token = format!("__CURSOR_HELPER_REPLACE_TOKEN_{token_seed}__");
         }
 
-        staged = staged.replace(old, &token);
+        staged = replace_workspace_scoped_matches(&staged, old, &token);
         tokens.push((token, *old));
         token_seed += 1;
     }
@@ -251,6 +251,34 @@ fn normalize_text_replacements(value: &str, replacements: &[(String, String)]) -
         }
     }
 
+    normalized
+}
+
+fn replace_workspace_scoped_matches(value: &str, pattern: &str, replacement: &str) -> String {
+    if pattern.is_empty() {
+        return value.to_string();
+    }
+
+    let mut offset = 0usize;
+    let mut normalized = String::with_capacity(value.len());
+
+    while let Some(pos) = value[offset..].find(pattern) {
+        let absolute_pos = offset + pos;
+
+        normalized.push_str(&value[offset..absolute_pos]);
+
+        let next_offset = absolute_pos + pattern.len();
+        let suffix = value[next_offset..].chars().next();
+        if is_workspace_value_suffix_terminator(suffix) {
+            normalized.push_str(replacement);
+        } else {
+            normalized.push_str(pattern);
+        }
+
+        offset = next_offset;
+    }
+
+    normalized.push_str(&value[offset..]);
     normalized
 }
 
@@ -612,5 +640,55 @@ mod tests {
             untouched_value,
             "meta:file:///home/user/projects/foo/hash-other"
         );
+    }
+
+    #[test]
+    fn test_update_global_state_db_does_not_corrupt_prefix_values_in_same_cell() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("state-prefix-cell.vscdb");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+            (
+                "workspace.key.file:///home/user/project",
+                r#"{"active":"file:///home/user/project","other":"file:///home/user/projects/foo","cache":"hash-old"}"#,
+            ),
+        )
+        .unwrap();
+        drop(conn);
+
+        let modified = update_global_state_db(
+            &db_path,
+            "/home/user/project",
+            "/home/user/project-copy",
+            "file:///home/user/project",
+            "file:///home/user/project-copy",
+            "hash-old",
+            "hash-new",
+            false,
+        )
+        .unwrap();
+        assert!(modified);
+
+        let conn = Connection::open(&db_path).unwrap();
+        let row_key: String = conn
+            .query_row("SELECT key FROM ItemTable", [], |row| row.get(0))
+            .unwrap();
+        let row_value: String = conn
+            .query_row("SELECT value FROM ItemTable", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(row_key, "workspace.key.file:///home/user/project-copy");
+        assert_eq!(
+            row_value,
+            r#"{"active":"file:///home/user/project-copy","other":"file:///home/user/projects/foo","cache":"hash-new"}"#
+        );
+        assert!(!row_value.contains("project-copy-copy"));
     }
 }
