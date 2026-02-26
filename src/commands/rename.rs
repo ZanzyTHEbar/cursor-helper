@@ -442,16 +442,15 @@ fn sync_workspace_composer_index(
         new_workspace_hash,
     );
 
-    let needs_update = force_index
-        || data_to_write.contains(old_uri)
+    let needs_update = data_to_write.contains(old_uri)
         || data_to_write.contains(old_path)
         || data_to_write.contains(old_workspace_hash);
 
-    if !needs_update {
+    if !needs_update && !force_index {
         return Ok(false);
     }
 
-    if normalized == data_to_write {
+    if normalized == data_to_write && !force_index {
         return Ok(false);
     }
 
@@ -538,7 +537,7 @@ fn normalize_text_replacements(data: &str, replacements: &[(&str, &str)]) -> Str
             token = format!("__CURSOR_HELPER_REPLACE_TOKEN_{seed}__");
         }
 
-        working = working.replace(*old, &token);
+        working = replace_composer_scoped_matches(&working, old, &token);
         placeholder_map.push((token, *old));
         seed += 1;
     }
@@ -554,6 +553,47 @@ fn normalize_text_replacements(data: &str, replacements: &[(&str, &str)]) -> Str
     }
 
     normalized
+}
+
+fn replace_composer_scoped_matches(value: &str, pattern: &str, replacement: &str) -> String {
+    if pattern.is_empty() {
+        return value.to_string();
+    }
+
+    let mut offset = 0usize;
+    let mut normalized = String::with_capacity(value.len());
+
+    while let Some(pos) = value[offset..].find(pattern) {
+        let absolute_pos = offset + pos;
+
+        normalized.push_str(&value[offset..absolute_pos]);
+
+        let next_offset = absolute_pos + pattern.len();
+        let suffix = value[next_offset..].chars().next();
+        if is_composer_value_suffix_terminator(suffix) {
+            normalized.push_str(replacement);
+        } else {
+            normalized.push_str(pattern);
+        }
+
+        offset = next_offset;
+    }
+
+    normalized.push_str(&value[offset..]);
+    normalized
+}
+
+fn is_composer_value_suffix_terminator(suffix: Option<char>) -> bool {
+    match suffix {
+        None => true,
+        Some(suffix) => {
+            !suffix.is_ascii_alphanumeric()
+                && suffix != '_'
+                && suffix != '-'
+                && suffix != '.'
+                && suffix != '%'
+        }
+    }
 }
 
 /// Create backup snapshots before mutating Cursor metadata.
@@ -1009,6 +1049,52 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_workspace_composer_index_force_index_writes_without_stale_references() {
+        let temp_dir = TempDir::new().unwrap();
+        let target_db = temp_dir.path().join("target.vscdb");
+
+        let composer_payload = r#"{"allComposers":[{"id":"file:///new/project/hash_new"}]}"#;
+        let conn = Connection::open(&target_db).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+            ("composer.composerData", composer_payload),
+        )
+        .unwrap();
+        drop(conn);
+
+        let updated = sync_workspace_composer_index(
+            None,
+            &target_db,
+            "file:///old/project",
+            "file:///new/project",
+            "/old/project",
+            "/new/project",
+            "hash_old",
+            "hash_new",
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert!(updated);
+
+        let conn = Connection::open(&target_db).unwrap();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = 'composer.composerData'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, composer_payload);
+    }
+
+    #[test]
     fn test_normalize_composer_data_avoids_uri_double_expand() {
         let value = r#"{"allComposers":[{"id":"file:///home/user/project/hash_old","path":"/home/user/project","title":"project"}]}"#;
 
@@ -1027,6 +1113,26 @@ mod tests {
             r#"{"allComposers":[{"id":"file:///home/user/project-copy/hash_new","path":"/home/user/project-copy","title":"project"}]}"#
         );
         assert!(!normalized.contains("file:///home/user/project-copy-copy"));
+    }
+
+    #[test]
+    fn test_normalize_composer_data_preserves_prefix_sibling_paths_in_same_cell() {
+        let value = r#"{"active":"file:///home/user/project","other":"file:///home/user/projects/foo","cache":"hash_old"}"#;
+
+        let normalized = normalize_composer_data(
+            value,
+            "file:///home/user/project",
+            "file:///home/user/project-copy",
+            "/home/user/project",
+            "/home/user/project-copy",
+            "hash_old",
+            "hash_new",
+        );
+
+        assert_eq!(
+            normalized,
+            r#"{"active":"file:///home/user/project-copy","other":"file:///home/user/projects/foo","cache":"hash_new"}"#
+        );
     }
 
     #[test]
