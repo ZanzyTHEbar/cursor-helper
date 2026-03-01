@@ -1,0 +1,35 @@
+[govctl]
+schema = 1
+id = "WI-2026-03-01-001"
+title = "Fix rename --copy metadata sync and cache/state consistency"
+status = "done"
+created = "2026-03-01"
+started = "2026-03-01"
+completed = "2026-03-01"
+
+[content]
+description = """
+PR #3 merged from ZanzyTHEbar/fix/rename-copy-chat-sync.
+
+Restores reliable `cursor-helper rename --copy` behavior so copied workspaces
+retain chat history visibility and related Cursor metadata is migrated safely."""
+
+[[content.acceptance_criteria]]
+text = "Add `--force-index` option for `rename --copy` to force composer index rebuild"
+status = "done"
+category = "added"
+
+[[content.acceptance_criteria]]
+text = "Fix `rename --copy` to preserve full chat history visibility by synchronizing `composer.composerData` and normalizing workspace references in the copied `workspaceStorage` DB"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "Extend `rename` copy flow to copy the full `workspaceStorage/<hash>/` directory, update both `storage.json` and `globalStorage/state.vscdb`, and clear stale Electron cache directories to prevent UI desync"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "All tests pass"
+status = "done"
+category = "chore"

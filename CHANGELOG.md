@@ -9,12 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `--force-index` option for `rename --copy` to force composer index rebuild (`cursor-helper rename --copy --force-index`).
+- Add `--force-index` option for `rename --copy` to force composer index rebuild (WI-2026-03-01-001)
 
 ### Fixed
 
-- Fix `rename --copy` to preserve full chat history visibility by synchronizing `composer.composerData` and normalizing workspace references in the copied `workspaceStorage` DB.
-- Extend `rename` copy flow to copy the full `workspaceStorage/<hash>/` directory, update both `storage.json` and `globalStorage/state.vscdb`, and clear stale Electron cache directories to prevent UI desync.
+- Fix `rename --copy` to preserve full chat history visibility by synchronizing `composer.composerData` and normalizing workspace references in the copied `workspaceStorage` DB (WI-2026-03-01-001)
+- Extend `rename` copy flow to copy the full `workspaceStorage/<hash>/` directory, update both `storage.json` and `globalStorage/state.vscdb`, and clear stale Electron cache directories to prevent UI desync (WI-2026-03-01-001)
 
 ## [0.2.1] - 2026-01-28
 

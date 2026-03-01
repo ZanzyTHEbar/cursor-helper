@@ -4,3 +4,4 @@ target/
 *.tar.gz
 .vscode/
 .cursor/
+.govctl.lock
