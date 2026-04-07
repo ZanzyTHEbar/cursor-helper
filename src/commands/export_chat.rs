@@ -134,6 +134,34 @@ pub struct ChatExport {
     pub sessions: Vec<ChatSession>,
 }
 
+fn emit_status(format: ExportFormat, message: impl AsRef<str>) {
+    match format {
+        ExportFormat::Json => eprintln!("{}", message.as_ref()),
+        ExportFormat::Markdown => println!("{}", message.as_ref()),
+    }
+}
+
+fn emit_export_output(
+    format: ExportFormat,
+    output: Option<&str>,
+    export: &ChatExport,
+) -> Result<()> {
+    let content = match format {
+        ExportFormat::Markdown => format_as_markdown(export),
+        ExportFormat::Json => serde_json::to_string_pretty(export)?,
+    };
+
+    if let Some(output_path) = output {
+        fs::write(output_path, &content)
+            .with_context(|| format!("Failed to write: {}", output_path))?;
+        emit_status(format, format!("Exported to: {}", output_path));
+    } else {
+        println!("{}", content);
+    }
+
+    Ok(())
+}
+
 /// Execute the export-chat command
 pub fn execute(
     project_path: &str,
@@ -191,22 +219,31 @@ pub fn execute(
         sessions.retain(|s| !s.messages.is_empty());
         let filtered = before - sessions.len();
         if filtered > 0 {
-            println!("Filtered {} blank session(s)", filtered);
+            emit_status(format, format!("Filtered {} blank session(s)", filtered));
         }
     }
-
-    if sessions.is_empty() {
-        println!("No chat sessions found for this project.");
-        return Ok(());
-    }
-
-    println!("Found {} chat session(s)", sessions.len());
 
     let project_path_str = project_path.to_string_lossy().to_string();
     let exported_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+
+    if sessions.is_empty() {
+        emit_status(format, "No chat sessions found for this project.");
+        if split {
+            return Ok(());
+        }
+
+        let export = ChatExport {
+            project_path: project_path_str,
+            exported_at,
+            sessions,
+        };
+        return emit_export_output(format, output, &export);
+    }
+
+    emit_status(format, format!("Found {} chat session(s)", sessions.len()));
 
     // Handle split output
     if split {
@@ -229,20 +266,7 @@ pub fn execute(
             sessions,
         };
 
-        // Format output
-        let content = match format {
-            ExportFormat::Markdown => format_as_markdown(&export),
-            ExportFormat::Json => serde_json::to_string_pretty(&export)?,
-        };
-
-        // Write or print
-        if let Some(output_path) = output {
-            fs::write(output_path, &content)
-                .with_context(|| format!("Failed to write: {}", output_path))?;
-            println!("Exported to: {}", output_path);
-        } else {
-            println!("{}", content);
-        }
+        emit_export_output(format, output, &export)?;
     }
 
     Ok(())
@@ -294,21 +318,30 @@ pub fn execute_by_id(
         sessions.retain(|s| !s.messages.is_empty());
         let filtered = before - sessions.len();
         if filtered > 0 {
-            println!("Filtered {} blank session(s)", filtered);
+            emit_status(format, format!("Filtered {} blank session(s)", filtered));
         }
     }
-
-    if sessions.is_empty() {
-        println!("No chat sessions found for this workspace.");
-        return Ok(());
-    }
-
-    println!("Found {} chat session(s)", sessions.len());
 
     let exported_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+
+    if sessions.is_empty() {
+        emit_status(format, "No chat sessions found for this workspace.");
+        if split {
+            return Ok(());
+        }
+
+        let export = ChatExport {
+            project_path,
+            exported_at,
+            sessions,
+        };
+        return emit_export_output(format, output, &export);
+    }
+
+    emit_status(format, format!("Found {} chat session(s)", sessions.len()));
 
     // Handle split output
     if split {
@@ -325,20 +358,7 @@ pub fn execute_by_id(
             sessions,
         };
 
-        // Format output
-        let content = match format {
-            ExportFormat::Markdown => format_as_markdown(&export),
-            ExportFormat::Json => serde_json::to_string_pretty(&export)?,
-        };
-
-        // Write or print
-        if let Some(output_path) = output {
-            fs::write(output_path, &content)
-                .with_context(|| format!("Failed to write: {}", output_path))?;
-            println!("Exported to: {}", output_path);
-        } else {
-            println!("{}", content);
-        }
+        emit_export_output(format, output, &export)?;
     }
 
     Ok(())
@@ -718,10 +738,13 @@ fn write_split_output(
             .with_context(|| format!("Failed to write: {}", file_path.display()))?;
     }
 
-    println!(
-        "Exported {} sessions to directory: {}",
-        sessions.len(),
-        output_dir
+    emit_status(
+        format,
+        format!(
+            "Exported {} sessions to directory: {}",
+            sessions.len(),
+            output_dir
+        ),
     );
 
     Ok(())
