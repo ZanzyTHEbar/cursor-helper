@@ -122,8 +122,8 @@ pub fn discover_workspace_sessions(
             }
             Err(err) => {
                 if sessions.is_empty() {
-                    if global_open_error.is_some() {
-                        return Err(global_open_error.unwrap()).context(err.to_string());
+                    if let Some(global_err) = global_open_error {
+                        return Err(global_err).context(err.to_string());
                     }
                     return Err(err);
                 }
