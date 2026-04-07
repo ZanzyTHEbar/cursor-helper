@@ -9,22 +9,30 @@
 use anyhow::{bail, Context, Result};
 use fs_extra::dir::{self, CopyOptions};
 use owo_colors::OwoColorize;
+use rusqlite::Connection;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::UNIX_EPOCH;
 use url::Url;
 
+use super::utils;
 use crate::config;
 use crate::cursor::{folder_id, storage, workspace};
 
 /// Execute the rename command
-pub fn execute(old_path: &str, new_path: &str, dry_run: bool, copy_mode: bool) -> Result<()> {
+pub fn execute(
+    old_path: &str,
+    new_path: &str,
+    dry_run: bool,
+    copy_mode: bool,
+    force_index: bool,
+) -> Result<()> {
     // Normalize and validate paths
     let old_path = normalize_path(old_path)?;
     let new_path = normalize_new_path(new_path)?;
 
-    // Validate
     if !old_path.exists() {
         bail!("Old path does not exist: {}", old_path.display());
     }
@@ -67,6 +75,8 @@ pub fn execute(old_path: &str, new_path: &str, dry_run: bool, copy_mode: bool) -
 
     let old_projects_dir = cursor_projects_dir.join(&old_folder_id);
     let old_workspace_dir = workspace_storage_dir.join(&old_workspace_hash);
+    let storage_json_path = global_storage_dir.join("storage.json");
+    let global_state_db_path = global_storage_dir.join("state.vscdb");
 
     // Mode description
     let mode = if copy_mode { "COPY" } else { "MOVE" };
@@ -82,6 +92,7 @@ pub fn execute(old_path: &str, new_path: &str, dry_run: bool, copy_mode: bool) -
     println!("Old path: {}", old_path.display());
     println!("New path: {}", new_path.display());
     println!("Mode: {}", mode);
+    println!("Force index: {}", if force_index { "on" } else { "off" });
     println!();
     println!("Old folder ID: {}", old_folder_id);
     println!("Old workspace hash: {}", old_workspace_hash);
@@ -106,6 +117,36 @@ pub fn execute(old_path: &str, new_path: &str, dry_run: bool, copy_mode: bool) -
         }
     }
 
+    // Step 0: Create backups for rollback safety
+    if dry_run {
+        println!("{}", "Step 0: Skipping backups in dry-run mode.".yellow());
+    } else {
+        println!("{}", "Step 0: Creating safety backup...".green());
+        if let Some(backup_dir) = create_rename_backup(
+            &old_projects_dir,
+            &old_workspace_dir,
+            &storage_json_path,
+            &global_state_db_path,
+            dry_run,
+        )? {
+            println!("  Backup created at: {}", backup_dir.display());
+        }
+    }
+
+    let old_uri = path_to_file_uri(&old_path)?;
+    let new_uri = path_to_file_uri(&new_path)?;
+    let old_path_raw = old_path.to_string_lossy().to_string();
+    let new_path_raw = new_path.to_string_lossy().to_string();
+    let estimated_move_hash = if !copy_mode {
+        Some(estimate_hash_after_move(&old_path, &new_path)?)
+    } else {
+        None
+    };
+
+    // Compute new folder ID (before creating destination)
+    let new_folder_id = folder_id::path_to_folder_id(&new_path);
+    println!("New folder ID: {}", new_folder_id);
+
     // Step 1: Copy/Move the project folder
     println!(
         "{}",
@@ -114,27 +155,29 @@ pub fn execute(old_path: &str, new_path: &str, dry_run: bool, copy_mode: bool) -
     println!("  {} -> {}", old_path.display(), new_path.display());
     copy_or_move(&old_path, &new_path, copy_mode, dry_run)?;
 
-    // Compute new identifiers
-    let new_folder_id = folder_id::path_to_folder_id(&new_path);
+    // Compute new workspace hash after destination exists
     let new_workspace_hash = if dry_run {
         if copy_mode {
-            // In copy mode with dry-run, we can't compute the hash
-            // because the new folder doesn't exist yet
             println!(
                 "  {}",
                 "(New folder would get new birthtime, hash computed at runtime)".yellow()
             );
             "<computed-at-runtime>".to_string()
         } else {
-            // Move preserves birthtime, estimate hash with new path
-            estimate_hash_after_move(&old_path, &new_path)?
+            estimated_move_hash
+                .clone()
+                .context("Failed to estimate moved workspace hash")?
         }
     } else {
         workspace::compute_workspace_hash(&new_path)?
     };
 
-    println!("New folder ID: {}", new_folder_id);
     println!("New workspace hash: {}", new_workspace_hash);
+
+    let mut source_composer_db: Option<PathBuf> = None;
+    if copy_mode && !dry_run && old_workspace_dir.exists() {
+        source_composer_db = Some(old_workspace_dir.join("state.vscdb"));
+    }
 
     // Step 2: Copy/Move ~/.cursor/projects/
     let new_projects_dir = cursor_projects_dir.join(&new_folder_id);
@@ -173,8 +216,6 @@ pub fn execute(old_path: &str, new_path: &str, dry_run: bool, copy_mode: bool) -
         let workspace_json_path = new_workspace_dir.join("workspace.json");
         println!("{}", "Step 4: Updating workspace.json...".green());
 
-        let new_uri = path_to_file_uri(&new_path)?;
-
         if dry_run {
             println!(
                 "  {} Write to {}:",
@@ -191,16 +232,49 @@ pub fn execute(old_path: &str, new_path: &str, dry_run: bool, copy_mode: bool) -
         println!("{}", "Step 3: No workspaceStorage data to migrate".yellow());
     }
 
-    // Step 5: Update storage.json
-    let storage_json_path = global_storage_dir.join("storage.json");
+    // Step 5: Ensure composer index in workspace state DB
+    if !dry_run && new_workspace_dir.exists() {
+        let new_workspace_db = new_workspace_dir.join("state.vscdb");
+        if new_workspace_db.exists() {
+            println!("{}", "Step 5: Synchronizing composer index...".green());
+            let updated = sync_workspace_composer_index(
+                source_composer_db.as_deref(),
+                &new_workspace_db,
+                &old_uri,
+                &new_uri,
+                &old_path_raw,
+                &new_path_raw,
+                &old_workspace_hash,
+                &new_workspace_hash,
+                force_index,
+                dry_run,
+            )?;
+            if updated {
+                println!("  -> Composer index synchronized");
+            } else {
+                println!("  -> Composer index already complete");
+            }
+        } else {
+            println!("  -> No workspace state DB found; skipping composer index sync");
+        }
+    } else if dry_run {
+        println!(
+            "{}",
+            "Step 5: Composer index sync skipped in dry-run".yellow()
+        );
+    } else {
+        println!(
+            "{}",
+            "Step 5: No workspace state DB available for sync".yellow()
+        );
+    }
+
+    // Step 6: Update storage.json
     if storage_json_path.exists() {
         println!(
             "{}",
-            "Step 5: Updating globalStorage/storage.json...".green()
+            "Step 6: Updating globalStorage/storage.json...".green()
         );
-
-        let old_uri = path_to_file_uri(&old_path)?;
-        let new_uri = path_to_file_uri(&new_path)?;
 
         if dry_run {
             println!("  {} Update {} -> {}", "[DRY-RUN]".blue(), old_uri, new_uri);
@@ -209,11 +283,82 @@ pub fn execute(old_path: &str, new_path: &str, dry_run: bool, copy_mode: bool) -
         let modified =
             storage::update_storage_json(&storage_json_path, &old_uri, &new_uri, dry_run)?;
 
-        if modified {
-            println!("  -> Updated workspace references");
-        } else {
-            println!("  -> No matching references found");
+        let hash_modified = old_workspace_hash != new_workspace_hash;
+        if hash_modified && !dry_run {
+            println!(
+                "  Note: storage.json hash migration skipped (format may be unsupported): {} -> {}",
+                old_workspace_hash, new_workspace_hash
+            );
+        } else if dry_run {
+            println!(
+                "  {} Hash migration in storage.json would run if needed",
+                "[DRY-RUN]".blue()
+            );
         }
+
+        if !modified && !hash_modified {
+            println!("  -> No matching storage.json updates applied");
+        }
+    } else {
+        println!("{}", "Step 6: No storage.json file found".yellow());
+    }
+
+    // Step 7: Update global state DB
+    if global_state_db_path.exists() {
+        println!(
+            "{}",
+            "Step 7: Updating globalStorage/state.vscdb...".green()
+        );
+
+        if dry_run {
+            println!("  {} Update {} -> {}", "[DRY-RUN]".blue(), old_uri, new_uri);
+            println!(
+                "  {} Update workspace hash {} -> {}",
+                "[DRY-RUN]".blue(),
+                old_workspace_hash,
+                new_workspace_hash
+            );
+        }
+
+        let global_modified = storage::update_global_state_db(
+            &global_state_db_path,
+            &old_path_raw,
+            &new_path_raw,
+            &old_uri,
+            &new_uri,
+            &old_workspace_hash,
+            &new_workspace_hash,
+            dry_run,
+        )?;
+
+        if global_modified {
+            println!("  -> Updated global state references");
+        } else {
+            println!("  -> No matching global state references found");
+        }
+    } else {
+        println!("{}", "Step 7: No global state DB found".yellow());
+    }
+
+    // Step 8: Clear stale cache directories
+    println!("{}", "Step 8: Clearing stale cache data...".green());
+    if !dry_run {
+        if new_workspace_dir.exists() {
+            clear_path(
+                &new_workspace_dir.join("anysphere.cursor-retrieval"),
+                dry_run,
+            )?;
+        } else {
+            println!("  -> No workspace cache directory for new path");
+        }
+
+        for cache_dir in config::cursor_cache_dirs()? {
+            if cache_dir.exists() {
+                clear_path(&cache_dir, dry_run)?;
+            }
+        }
+    } else {
+        println!("  -> Cache clear skipped in dry-run");
     }
 
     // Done!
@@ -235,6 +380,308 @@ pub fn execute(old_path: &str, new_path: &str, dry_run: bool, copy_mode: bool) -
             );
         }
     }
+
+    Ok(())
+}
+
+/// Update composer index in workspace state DB when copied from an existing workspace
+#[allow(clippy::too_many_arguments)]
+fn sync_workspace_composer_index(
+    source_db_path: Option<&Path>,
+    target_db_path: &Path,
+    old_uri: &str,
+    new_uri: &str,
+    old_path: &str,
+    new_path: &str,
+    old_workspace_hash: &str,
+    new_workspace_hash: &str,
+    force_index: bool,
+    dry_run: bool,
+) -> Result<bool> {
+    let target_conn = Connection::open(target_db_path).with_context(|| {
+        format!(
+            "Failed to open target workspace DB: {}",
+            target_db_path.display()
+        )
+    })?;
+
+    let source_data = if let Some(source_db_path) = source_db_path {
+        if source_db_path.exists() {
+            let source_conn = Connection::open(source_db_path).with_context(|| {
+                format!(
+                    "Failed to open source workspace DB: {}",
+                    source_db_path.display()
+                )
+            })?;
+            fetch_composer_data(&source_conn)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let target_data = fetch_composer_data(&target_conn)?;
+
+    let data_to_write = match source_data {
+        Some(data) => data,
+        None => target_data.unwrap_or_default(),
+    };
+
+    if data_to_write.is_empty() {
+        return Ok(false);
+    }
+
+    let normalized = normalize_composer_data(
+        &data_to_write,
+        old_uri,
+        new_uri,
+        old_path,
+        new_path,
+        old_workspace_hash,
+        new_workspace_hash,
+    );
+
+    let needs_update = data_to_write.contains(old_uri)
+        || data_to_write.contains(old_path)
+        || data_to_write.contains(old_workspace_hash);
+
+    if !needs_update && !force_index {
+        return Ok(false);
+    }
+
+    if normalized == data_to_write && !force_index {
+        return Ok(false);
+    }
+
+    if dry_run {
+        return Ok(true);
+    }
+
+    update_composer_data(&target_conn, &normalized)?;
+    Ok(true)
+}
+
+/// Update composer.composerData in ItemTable
+fn update_composer_data(conn: &Connection, data: &str) -> Result<()> {
+    let updated = conn
+        .execute(
+            "UPDATE ItemTable SET value = ?1 WHERE key = 'composer.composerData'",
+            [data],
+        )
+        .with_context(|| "Failed to update composer.composerData")?;
+
+    if updated == 0 {
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES ('composer.composerData', ?1)",
+            [data],
+        )
+        .with_context(|| "Failed to insert composer.composerData")?;
+    }
+
+    Ok(())
+}
+
+fn fetch_composer_data(conn: &Connection) -> Result<Option<String>> {
+    match conn.query_row(
+        "SELECT value FROM ItemTable WHERE key = 'composer.composerData'",
+        [],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e).context("Failed to query composer.composerData"),
+    }
+}
+
+fn normalize_composer_data(
+    data: &str,
+    old_uri: &str,
+    new_uri: &str,
+    old_path: &str,
+    new_path: &str,
+    old_workspace_hash: &str,
+    new_workspace_hash: &str,
+) -> String {
+    let replacements = [
+        (old_uri, new_uri),
+        (old_path, new_path),
+        (old_workspace_hash, new_workspace_hash),
+    ];
+    normalize_text_replacements(data, &replacements)
+}
+
+fn normalize_text_replacements(data: &str, replacements: &[(&str, &str)]) -> String {
+    let replacements: Vec<(&str, &str)> = replacements
+        .iter()
+        .copied()
+        .filter(|(old, new)| old != new)
+        .collect();
+
+    if replacements.is_empty() {
+        return data.to_string();
+    }
+
+    let mut seed = 0usize;
+    let mut working = data.to_string();
+    let mut placeholder_map = Vec::new();
+
+    for (old, _) in &replacements {
+        let mut token = format!("__CURSOR_HELPER_REPLACE_TOKEN_{seed}__");
+        while working.contains(&token)
+            || placeholder_map
+                .iter()
+                .any(|(placeholder, _)| placeholder == &token)
+        {
+            seed += 1;
+            token = format!("__CURSOR_HELPER_REPLACE_TOKEN_{seed}__");
+        }
+
+        working = replace_composer_scoped_matches(&working, old, &token);
+        placeholder_map.push((token, *old));
+        seed += 1;
+    }
+
+    let mut normalized = working;
+    for (token, old) in placeholder_map {
+        if let Some((_, new)) = replacements
+            .iter()
+            .find(|(candidate_old, _)| candidate_old == &old)
+        {
+            normalized = normalized.replace(&token, new);
+        }
+    }
+
+    normalized
+}
+
+fn replace_composer_scoped_matches(value: &str, pattern: &str, replacement: &str) -> String {
+    if pattern.is_empty() {
+        return value.to_string();
+    }
+
+    let mut offset = 0usize;
+    let mut normalized = String::with_capacity(value.len());
+
+    while let Some(pos) = value[offset..].find(pattern) {
+        let absolute_pos = offset + pos;
+
+        normalized.push_str(&value[offset..absolute_pos]);
+
+        let next_offset = absolute_pos + pattern.len();
+        let suffix = value[next_offset..].chars().next();
+        if is_composer_value_suffix_terminator(suffix) {
+            normalized.push_str(replacement);
+        } else {
+            normalized.push_str(pattern);
+        }
+
+        offset = next_offset;
+    }
+
+    normalized.push_str(&value[offset..]);
+    normalized
+}
+
+fn is_composer_value_suffix_terminator(suffix: Option<char>) -> bool {
+    match suffix {
+        None => true,
+        Some(suffix) => {
+            !suffix.is_ascii_alphanumeric()
+                && suffix != '_'
+                && suffix != '-'
+                && suffix != '.'
+                && suffix != '%'
+        }
+    }
+}
+
+/// Create backup snapshots before mutating Cursor metadata.
+fn create_rename_backup(
+    old_projects_dir: &Path,
+    old_workspace_dir: &Path,
+    storage_json_path: &Path,
+    global_state_db_path: &Path,
+    dry_run: bool,
+) -> Result<Option<PathBuf>> {
+    if dry_run {
+        return Ok(None);
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let backup_root = std::env::temp_dir().join(format!("cursor-helper-rename-backup-{timestamp}"));
+    fs::create_dir_all(&backup_root).with_context(|| {
+        format!(
+            "Failed to create backup directory: {}",
+            backup_root.display()
+        )
+    })?;
+
+    if old_projects_dir.exists() {
+        let backup_projects = backup_root.join("old_projects");
+        utils::copy_dir(old_projects_dir, &backup_projects)?;
+        println!("  Backup projects: {}", backup_projects.display());
+    }
+
+    if old_workspace_dir.exists() {
+        let backup_workspace = backup_root.join("old_workspace");
+        utils::copy_dir(old_workspace_dir, &backup_workspace)?;
+        println!("  Backup workspaceStorage: {}", backup_workspace.display());
+    }
+
+    if storage_json_path.exists() {
+        let target = backup_root.join("storage.json");
+        fs::copy(storage_json_path, &target).with_context(|| {
+            format!(
+                "Failed to backup {} to {}",
+                storage_json_path.display(),
+                target.display()
+            )
+        })?;
+        println!("  Backup storage.json: {}", target.display());
+    }
+
+    if global_state_db_path.exists() {
+        let target = backup_root.join("state.vscdb");
+        fs::copy(global_state_db_path, &target).with_context(|| {
+            format!(
+                "Failed to backup {} to {}",
+                global_state_db_path.display(),
+                target.display()
+            )
+        })?;
+        println!("  Backup global state DB: {}", target.display());
+    }
+
+    Ok(Some(backup_root))
+}
+
+/// Clear stale cache files or directories.
+fn clear_path(path: &Path, dry_run: bool) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if dry_run {
+        println!(
+            "  {} Remove {} (dry-run)",
+            "[DRY-RUN]".blue(),
+            path.display()
+        );
+        return Ok(());
+    }
+
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("Failed to remove directory: {}", path.display()))?;
+    } else {
+        fs::remove_file(path)
+            .with_context(|| format!("Failed to remove file: {}", path.display()))?;
+    }
+    println!("  -> Removed: {}", path.display());
 
     Ok(())
 }
@@ -428,8 +875,6 @@ fn path_to_file_uri(path: &Path) -> Result<String> {
 
 /// Estimate workspace hash after a move (uses old birthtime with new path)
 fn estimate_hash_after_move(old_path: &Path, new_path: &Path) -> Result<String> {
-    use std::time::UNIX_EPOCH;
-
     let metadata = fs::metadata(old_path)?;
     let created = metadata.created()?;
     let duration = created.duration_since(UNIX_EPOCH)?;
@@ -444,6 +889,8 @@ fn estimate_hash_after_move(old_path: &Path, new_path: &Path) -> Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use tempfile::TempDir;
 
     #[test]
     fn test_clean_path_basic() {
@@ -453,14 +900,12 @@ mod tests {
 
     #[test]
     fn test_clean_path_with_current_dir() {
-        // . components should be removed
         let path = PathBuf::from("/home/./user/./project");
         assert_eq!(clean_path(&path), PathBuf::from("/home/user/project"));
     }
 
     #[test]
     fn test_clean_path_with_parent_dir() {
-        // .. should navigate up
         let path = PathBuf::from("/home/user/../admin/project");
         assert_eq!(clean_path(&path), PathBuf::from("/home/admin/project"));
     }
@@ -501,5 +946,211 @@ mod tests {
         let uri = path_to_file_uri(&path).unwrap();
         assert!(uri.starts_with("file:///"));
         assert!(uri.contains("Users"));
+    }
+
+    #[test]
+    fn test_sync_workspace_composer_index_normalizes_when_all_composers_present() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_db = temp_dir.path().join("source.vscdb");
+        let target_db = temp_dir.path().join("target.vscdb");
+
+        let composer_payload = r#"{"allComposers":[{"id":"file:///old/project/hash_old"}]}"#;
+        let conn = Connection::open(&source_db).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+            ("composer.composerData", composer_payload),
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = Connection::open(&target_db).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+            ("composer.composerData", composer_payload),
+        )
+        .unwrap();
+        drop(conn);
+
+        let updated = sync_workspace_composer_index(
+            Some(&source_db),
+            &target_db,
+            "file:///old/project",
+            "file:///new/project",
+            "/old/project",
+            "/new/project",
+            "hash_old",
+            "hash_new",
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(updated);
+
+        let conn = Connection::open(&target_db).unwrap();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = 'composer.composerData'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(value.contains("file:///new/project"));
+        assert!(value.contains("hash_new"));
+        assert!(!value.contains("file:///old/project"));
+        assert!(!value.contains("hash_old"));
+    }
+
+    #[test]
+    fn test_sync_workspace_composer_index_no_update_without_stale_references() {
+        let temp_dir = TempDir::new().unwrap();
+        let target_db = temp_dir.path().join("target.vscdb");
+
+        let composer_payload = r#"{"allComposers":[{"id":"file:///new/project/hash_new"}]}"#;
+        let conn = Connection::open(&target_db).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+            ("composer.composerData", composer_payload),
+        )
+        .unwrap();
+        drop(conn);
+
+        let updated = sync_workspace_composer_index(
+            None,
+            &target_db,
+            "file:///old/project",
+            "file:///new/project",
+            "/old/project",
+            "/new/project",
+            "hash_old",
+            "hash_new",
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(!updated);
+    }
+
+    #[test]
+    fn test_sync_workspace_composer_index_force_index_writes_without_stale_references() {
+        let temp_dir = TempDir::new().unwrap();
+        let target_db = temp_dir.path().join("target.vscdb");
+
+        let composer_payload = r#"{"allComposers":[{"id":"file:///new/project/hash_new"}]}"#;
+        let conn = Connection::open(&target_db).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+            ("composer.composerData", composer_payload),
+        )
+        .unwrap();
+        drop(conn);
+
+        let updated = sync_workspace_composer_index(
+            None,
+            &target_db,
+            "file:///old/project",
+            "file:///new/project",
+            "/old/project",
+            "/new/project",
+            "hash_old",
+            "hash_new",
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert!(updated);
+
+        let conn = Connection::open(&target_db).unwrap();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = 'composer.composerData'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, composer_payload);
+    }
+
+    #[test]
+    fn test_normalize_composer_data_avoids_uri_double_expand() {
+        let value = r#"{"allComposers":[{"id":"file:///home/user/project/hash_old","path":"/home/user/project","title":"project"}]}"#;
+
+        let normalized = normalize_composer_data(
+            value,
+            "file:///home/user/project",
+            "file:///home/user/project-copy",
+            "/home/user/project",
+            "/home/user/project-copy",
+            "hash_old",
+            "hash_new",
+        );
+
+        assert_eq!(
+            normalized,
+            r#"{"allComposers":[{"id":"file:///home/user/project-copy/hash_new","path":"/home/user/project-copy","title":"project"}]}"#
+        );
+        assert!(!normalized.contains("file:///home/user/project-copy-copy"));
+    }
+
+    #[test]
+    fn test_normalize_composer_data_preserves_prefix_sibling_paths_in_same_cell() {
+        let value = r#"{"active":"file:///home/user/project","other":"file:///home/user/projects/foo","cache":"hash_old"}"#;
+
+        let normalized = normalize_composer_data(
+            value,
+            "file:///home/user/project",
+            "file:///home/user/project-copy",
+            "/home/user/project",
+            "/home/user/project-copy",
+            "hash_old",
+            "hash_new",
+        );
+
+        assert_eq!(
+            normalized,
+            r#"{"active":"file:///home/user/project-copy","other":"file:///home/user/projects/foo","cache":"hash_new"}"#
+        );
+    }
+
+    #[test]
+    fn test_normalize_composer_data_handles_encoded_uri() {
+        let value = r#"{"allComposers":[{"id":"file:///home/user/my%20project/hash_old"}]}"#;
+        let normalized = normalize_composer_data(
+            value,
+            "file:///home/user/my%20project",
+            "file:///home/user/my%20project-backup",
+            "/home/user/my project",
+            "/home/user/my project-backup",
+            "hash_old",
+            "hash_new",
+        );
+
+        assert_eq!(
+            normalized,
+            r#"{"allComposers":[{"id":"file:///home/user/my%20project-backup/hash_new"}]}"#
+        );
     }
 }
