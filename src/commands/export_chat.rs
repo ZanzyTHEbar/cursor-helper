@@ -24,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::utils;
+use crate::cursor::chat_sessions;
 
 /// Output format for chat export
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,57 +349,15 @@ fn extract_chat_sessions(
     workspace_dir: &Path,
     options: &ExportOptions,
 ) -> Result<Vec<ChatSession>> {
-    let db_path = workspace_dir.join("state.vscdb");
-
-    if !db_path.exists() {
-        return Ok(vec![]);
-    }
-
-    let conn = Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
-
-    // Query composer metadata from workspace storage
-    // QueryReturnedNoRows means no chat sessions exist, not an error
-    let composer_data: Option<String> = match conn.query_row(
-        "SELECT value FROM ItemTable WHERE key = 'composer.composerData'",
-        [],
-        |row| row.get(0),
-    ) {
-        Ok(data) => Some(data),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!("Failed to query chat metadata from: {}", db_path.display())
-            })
-        }
-    };
-
-    // Parse composer metadata to get session info
-    let composers: Vec<ComposerInfo> = composer_data
-        .as_ref()
-        .and_then(|data| parse_composer_data(data, options.include_archived))
-        .unwrap_or_default();
+    let composers =
+        chat_sessions::discover_workspace_sessions(workspace_dir, options.include_archived)?;
 
     if composers.is_empty() {
         return Ok(vec![]);
     }
 
     // Open global storage for bubble content (optional - may not exist on all setups)
-    let global_db_path = crate::config::global_storage_dir()
-        .ok()
-        .map(|d| d.join("state.vscdb"))
-        .filter(|p| p.exists());
-
-    let global_conn = global_db_path.and_then(|path| {
-        Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .ok() // Global storage is optional - proceed without messages if unavailable
-    });
+    let global_conn = chat_sessions::open_global_state_db().ok().flatten();
 
     // Build sessions with messages from global storage
     let mut sessions = Vec::new();
@@ -412,10 +371,10 @@ fn extract_chat_sessions(
 
         sessions.push(ChatSession {
             id: composer.composer_id.clone(),
-            title: Some(composer.name.clone()),
+            title: composer.title.clone(),
             messages,
-            created_at: Some(composer.created_at / 1000),
-            updated_at: Some(composer.last_updated_at / 1000),
+            created_at: composer.created_at_ms.map(|ts| ts / 1000),
+            updated_at: composer.updated_at_ms.map(|ts| ts / 1000),
         });
     }
 
@@ -619,59 +578,6 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
         let truncated: String = s.chars().take(max_chars).collect();
         format!("{}...[truncated]", truncated)
     }
-}
-
-/// Composer metadata from composer.composerData
-#[derive(Debug, Clone)]
-struct ComposerInfo {
-    composer_id: String,
-    name: String,
-    created_at: i64,
-    last_updated_at: i64,
-}
-
-/// Parse composer.composerData JSON
-fn parse_composer_data(data: &str, include_archived: bool) -> Option<Vec<ComposerInfo>> {
-    let json: serde_json::Value = serde_json::from_str(data).ok()?;
-    let composers = json.get("allComposers")?.as_array()?;
-
-    let mut result = Vec::new();
-    for c in composers {
-        // Skip archived composers unless explicitly included
-        let is_archived = c
-            .get("isArchived")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if is_archived && !include_archived {
-            continue;
-        }
-
-        // Try to parse each composer, skip if any required field is missing
-        let Some(composer_id) = c.get("composerId").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let name = c
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("Untitled")
-            .to_string();
-        let Some(created_at) = c.get("createdAt").and_then(|v| v.as_i64()) else {
-            continue;
-        };
-        let last_updated_at = c
-            .get("lastUpdatedAt")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(created_at);
-
-        result.push(ComposerInfo {
-            composer_id: composer_id.to_string(),
-            name,
-            created_at,
-            last_updated_at,
-        });
-    }
-
-    Some(result)
 }
 
 /// Format a single message as markdown

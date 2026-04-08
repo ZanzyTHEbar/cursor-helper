@@ -1,5 +1,6 @@
 //! Core Cursor IDE operations
 
+pub mod chat_sessions;
 pub mod folder_id;
 pub mod storage;
 pub mod workspace;
